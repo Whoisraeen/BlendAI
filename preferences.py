@@ -156,7 +156,12 @@ class AICodePreferences(bpy.types.AddonPreferences):
         
         # Provider-specific settings
         if self.ai_provider == 'openai':
-            provider_box.prop(self, "openai_api_key")
+            # API Key field with visual indicator
+            key_row = provider_box.row()
+            if not self.openai_api_key or not self.openai_api_key.strip():
+                key_row.alert = True
+            key_row.prop(self, "openai_api_key")
+            
             provider_box.prop(self, "openai_model")
             
             # Show model info
@@ -172,7 +177,12 @@ class AICodePreferences(bpy.types.AddonPreferences):
                 info_row.label(text=model_info[self.openai_model], icon='INFO')
                 
         elif self.ai_provider == 'anthropic':
-            provider_box.prop(self, "anthropic_api_key")
+            # API Key field with visual indicator
+            key_row = provider_box.row()
+            if not self.anthropic_api_key or not self.anthropic_api_key.strip():
+                key_row.alert = True
+            key_row.prop(self, "anthropic_api_key")
+            
             provider_box.prop(self, "anthropic_model")
             
             # Show model info
@@ -187,7 +197,12 @@ class AICodePreferences(bpy.types.AddonPreferences):
                 info_row.label(text=model_info[self.anthropic_model], icon='INFO')
                 
         elif self.ai_provider == 'gemini':
-            provider_box.prop(self, "gemini_api_key")
+            # API Key field with visual indicator
+            key_row = provider_box.row()
+            if not self.gemini_api_key or not self.gemini_api_key.strip():
+                key_row.alert = True
+            key_row.prop(self, "gemini_api_key")
+            
             provider_box.prop(self, "gemini_model")
             
             # Show model info  
@@ -202,7 +217,12 @@ class AICodePreferences(bpy.types.AddonPreferences):
                 info_row.label(text=model_info[self.gemini_model], icon='INFO')
                 
         elif self.ai_provider == 'local':
-            provider_box.prop(self, "local_api_url")
+            # API URL field with visual indicator
+            url_row = provider_box.row()
+            if not self.local_api_url or not self.local_api_url.strip():
+                url_row.alert = True
+            url_row.prop(self, "local_api_url")
+            
             provider_box.prop(self, "local_model")
             
         # Enhanced Features
@@ -241,8 +261,22 @@ class AICodePreferences(bpy.types.AddonPreferences):
             
         if api_key and api_key.strip():
             status_box.label(text="✅ API configured", icon='CHECKMARK')
+            # Add test connection button
+            test_row = status_box.row()
+            test_row.operator("ai.test_connection", text="Test Connection", icon='PLUGIN')
         else:
-            status_box.label(text="❌ API key required", icon='ERROR')
+            # Enhanced warning for missing API key
+            warning_row = status_box.row()
+            warning_row.alert = True
+            warning_row.label(text="⚠️ API key required for AI functionality", icon='ERROR')
+            
+            # Provider-specific guidance
+            if self.ai_provider == 'openai':
+                status_box.label(text="→ Visit platform.openai.com to get your API key")
+            elif self.ai_provider == 'anthropic':
+                status_box.label(text="→ Visit console.anthropic.com to get your API key")
+            elif self.ai_provider == 'gemini':
+                status_box.label(text="→ Visit aistudio.google.com to get your API key")
             
         # Quick setup tips
         tips_box = layout.box()
@@ -250,12 +284,27 @@ class AICodePreferences(bpy.types.AddonPreferences):
         if self.ai_provider == 'openai':
             tips_box.label(text="• Get your API key from platform.openai.com")
             tips_box.label(text="• GPT-4.1 offers the best capabilities for 3D modeling")
+            tips_box.label(text="• Create an account and navigate to API Keys section")
         elif self.ai_provider == 'anthropic':
             tips_box.label(text="• Get your API key from console.anthropic.com")
             tips_box.label(text="• Claude 4 Opus excels at complex coding tasks")
+            tips_box.label(text="• Sign up and go to API Keys in your dashboard")
         elif self.ai_provider == 'gemini':
             tips_box.label(text="• Get your API key from aistudio.google.com")
             tips_box.label(text="• Gemini 2.5 models support advanced reasoning")
+            tips_box.label(text="• Create a project and generate an API key")
         elif self.ai_provider == 'local':
             tips_box.label(text="• Ensure your local LLM server is running")
             tips_box.label(text="• Test the URL in your browser first")
+            tips_box.label(text="• Common ports: 8080, 11434 (Ollama), 5000")
+            
+        # Security information
+        security_box = layout.box()
+        security_box.label(text="🔒 Security & Privacy:", icon='LOCKED')
+        security_box.label(text="• API keys are stored locally in Blender preferences")
+        security_box.label(text="• Keys are not transmitted except to your chosen AI provider")
+        security_box.label(text="• For maximum security, use environment variables")
+        if self.ai_provider != 'local':
+            security_box.label(text="• Your code prompts are sent to the AI provider for processing")
+        else:
+            security_box.label(text="• Local models keep all data on your machine")

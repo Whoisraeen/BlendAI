@@ -16,20 +16,39 @@ class AIClient:
         self.backend = backend
         self.response_log = []
         self.previous_scene_state = None
+        self._max_context_tokens = {
+            'openai': 128000,  # GPT-4 context limit
+            'anthropic': 200000,  # Claude context limit
+            'gemini': 1000000,  # Gemini context limit
+            'local': 32000  # Conservative default for local models
+        }
 
+    def sync_backend_with_prefs(self):
+        """Ensure backend is in sync with user preferences"""
+        try:
+            addon_prefs = bpy.context.preferences.addons[__package__].preferences
+            preferred_backend = addon_prefs.ai_provider.lower()
+            if preferred_backend != self.backend:
+                self.backend = preferred_backend
+        except Exception as e:
+            print(f"Warning: Could not sync backend with preferences: {e}")
+    
     def get_api_key(self):
-        # Securely get API key from Blender's preferences
-        addon_prefs = bpy.context.preferences.addons[__package__].preferences
-        if self.backend == 'openai':
-            return addon_prefs.openai_api_key
-        elif self.backend == 'anthropic':
-            return addon_prefs.anthropic_api_key
-        elif self.backend == 'gemini':
-            return addon_prefs.gemini_api_key
-        elif self.backend == 'local':
-            return "local"  # Local doesn't need API key
-        else:
-            raise AIBackendError(f"Unknown backend: {self.backend}")
+        """Securely get API key from Blender's preferences"""
+        try:
+            addon_prefs = bpy.context.preferences.addons[__package__].preferences
+            if self.backend == 'openai':
+                return addon_prefs.openai_api_key
+            elif self.backend == 'anthropic':
+                return addon_prefs.anthropic_api_key
+            elif self.backend == 'gemini':
+                return addon_prefs.gemini_api_key
+            elif self.backend == 'local':
+                return "local"  # Local doesn't need API key
+            else:
+                raise AIBackendError(f"Unknown backend: {self.backend}")
+        except Exception as e:
+            raise AIBackendError(f"Failed to retrieve API key for {self.backend}: {str(e)}")
 
     def map_model_name(self, model_name, backend):
         """Map internal model names to API model names"""
@@ -121,7 +140,35 @@ class AIClient:
             
         return None
 
-    def get_detailed_scene_context(self):
+    def estimate_token_count(self, text):
+        """Rough estimation of token count (approximately 4 characters per token)"""
+        return len(text) // 4
+    
+    def trim_context_if_needed(self, context, max_tokens):
+        """Trim context to fit within token limits while preserving essential information"""
+        # Always preserve essential context
+        essential_keys = ['scene_name', 'mode', 'blender_version', 'render_engine', 
+                         'selected_objects', 'active_object', 'total_objects']
+        
+        # Start with essential context
+        trimmed_context = {key: context[key] for key in essential_keys if key in context}
+        
+        # Add other context items if space allows
+        optional_keys = ['all_objects', 'materials', 'lights', 'cameras', 'collections']
+        
+        for key in optional_keys:
+            if key in context:
+                # Limit large lists to prevent token overflow
+                if key == 'all_objects' and len(context[key]) > 50:
+                    trimmed_context[key] = context[key][:50]  # Limit to 50 objects
+                elif key == 'materials' and len(context[key]) > 20:
+                    trimmed_context[key] = context[key][:20]  # Limit to 20 materials
+                else:
+                    trimmed_context[key] = context[key]
+        
+        return trimmed_context
+    
+    def get_detailed_scene_context(self, trim_for_backend=None):
         """Get comprehensive scene context including all objects, materials, etc."""
         context = {
             'scene_name': bpy.context.scene.name,
@@ -201,11 +248,19 @@ class AIClient:
             for col in bpy.data.collections
         ]
         
+        # Apply token management if backend specified
+        if trim_for_backend and trim_for_backend in self._max_context_tokens:
+            max_tokens = self._max_context_tokens[trim_for_backend] // 4  # Reserve 3/4 for response
+            context = self.trim_context_if_needed(context, max_tokens)
+        
         return context
 
     def build_prompt(self, user_request):
         """Build comprehensive prompt with scene context and optional screenshot"""
-        context = self.get_detailed_scene_context()
+        # Sync backend with preferences before building prompt
+        self.sync_backend_with_prefs()
+        
+        context = self.get_detailed_scene_context(trim_for_backend=self.backend)
         addon_prefs = bpy.context.preferences.addons[__package__].preferences
         
         # Enhanced system prompt
@@ -357,187 +412,298 @@ class AIClient:
         return "CHANGES SUMMARY:\n" + "\n".join(changes)
 
     def call_openai(self, prompt, screenshot_data=None, **kwargs):
-        """Call OpenAI API with enhanced support"""
-        api_key = self.get_api_key()
-        if not api_key:
-            raise AIBackendError("OpenAI API key not set")
-        
-        addon_prefs = bpy.context.preferences.addons[__package__].preferences
-        model = self.map_model_name(kwargs.get('model', addon_prefs.openai_model), 'openai')
-        
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        # Build messages
-        messages = [{"role": "user", "content": prompt}]
-        
-        # Add screenshot if available (for vision models)
-        if screenshot_data and model in ['gpt-4o', 'gpt-4o-mini']:
-            messages = [{
-                "role": "user", 
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_data}"}}
-                ]
-            }]
-        
-        data = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": kwargs.get('max_tokens', 4000),
-            "temperature": kwargs.get('temperature', 0.1)
-        }
-        
-        response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=data)
-        response.raise_for_status()
-        
-        result = response.json()
-        return result['choices'][0]['message']['content']
+        """Call OpenAI API with enhanced support and error handling"""
+        try:
+            api_key = self.get_api_key()
+            if not api_key:
+                raise AIBackendError("OpenAI API key not set in preferences")
+            
+            addon_prefs = bpy.context.preferences.addons[__package__].preferences
+            model = self.map_model_name(kwargs.get('model', addon_prefs.openai_model), 'openai')
+            
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            # Build messages
+            messages = [{"role": "user", "content": prompt}]
+            
+            # Add screenshot if available (for vision models)
+            if screenshot_data and model in ['gpt-4o', 'gpt-4o-mini', 'gpt-4o-2024-11-20', 'gpt-4o-mini-2024-07-18']:
+                messages = [{
+                    "role": "user", 
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_data}"}}
+                    ]
+                }]
+                print(f"OpenAI: Including viewport screenshot for vision model {model}")
+            
+            data = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": kwargs.get('max_tokens', 4000),
+                "temperature": kwargs.get('temperature', 0.1)
+            }
+            
+            response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=data, timeout=60)
+            response.raise_for_status()
+            
+            result = response.json()
+            
+            if 'choices' in result and result['choices']:
+                return result['choices'][0]['message']['content']
+            elif 'error' in result:
+                error_msg = result['error'].get('message', 'Unknown error')
+                raise AIBackendError(f"OpenAI API error: {error_msg}")
+            else:
+                raise AIBackendError("OpenAI API returned no choices in response")
+                
+        except requests.exceptions.Timeout:
+            raise AIBackendError("OpenAI API request timed out. Please try again.")
+        except requests.exceptions.ConnectionError:
+            raise AIBackendError("Failed to connect to OpenAI API. Check your internet connection.")
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                raise AIBackendError("Invalid OpenAI API key. Please check your API key in preferences.")
+            elif e.response.status_code == 429:
+                raise AIBackendError("OpenAI API rate limit exceeded. Please wait and try again.")
+            elif e.response.status_code == 400:
+                raise AIBackendError("Invalid request to OpenAI API. Check your model selection and parameters.")
+            else:
+                raise AIBackendError(f"OpenAI API HTTP error {e.response.status_code}: {e.response.text}")
+        except Exception as e:
+            raise AIBackendError(f"Unexpected error calling OpenAI API: {str(e)}")
 
     def call_anthropic(self, prompt, screenshot_data=None, **kwargs):
-        """Call Anthropic API with enhanced support"""
-        api_key = self.get_api_key()
-        if not api_key:
-            raise AIBackendError("Anthropic API key not set")
+        """Call Anthropic API with enhanced support and error handling"""
+        try:
+            api_key = self.get_api_key()
+            if not api_key:
+                raise AIBackendError("Anthropic API key not set in preferences")
+                
+            addon_prefs = bpy.context.preferences.addons[__package__].preferences
+            model = self.map_model_name(kwargs.get('model', addon_prefs.anthropic_model), 'anthropic')
             
-        addon_prefs = bpy.context.preferences.addons[__package__].preferences
-        model = self.map_model_name(kwargs.get('model', addon_prefs.anthropic_model), 'anthropic')
-        
-        headers = {
-            "x-api-key": api_key,
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01"
-        }
-        
-        # Build content
-        content = [{"type": "text", "text": prompt}]
-        
-        # Add screenshot if available
-        if screenshot_data:
-            content.append({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": "image/png",
-                    "data": screenshot_data
-                }
-            })
-        
-        data = {
-            "model": model,
-            "max_tokens": kwargs.get('max_tokens', 4000),
-            "temperature": kwargs.get('temperature', 0.1),
-            "messages": [{"role": "user", "content": content}]
-        }
-        
-        # Add thinking budget for supported models
-        if any(x in model for x in ['claude-4', 'claude-3-7', 'claude-3.7']):
-            thinking_budget = addon_prefs.thinking_budget
-            if thinking_budget != 'auto':
-                thinking_map = {
-                    'low': 2000,
-                    'medium': 8000, 
-                    'high': 32000,
-                    'max': 64000
-                }
-                if thinking_budget in thinking_map:
-                    data['max_completion_tokens'] = thinking_map[thinking_budget]
-        
-        response = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=data)
-        response.raise_for_status()
-        
-        result = response.json()
-        return result['content'][0]['text']
+            headers = {
+                "x-api-key": api_key,
+                "Content-Type": "application/json",
+                "anthropic-version": "2023-06-01"
+            }
+            
+            # Build content
+            content = [{"type": "text", "text": prompt}]
+            
+            # Add screenshot if available
+            if screenshot_data:
+                content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": screenshot_data
+                    }
+                })
+                print(f"Anthropic: Including viewport screenshot for enhanced context understanding")
+            
+            data = {
+                "model": model,
+                "max_tokens": kwargs.get('max_tokens', 4000),
+                "temperature": kwargs.get('temperature', 0.1),
+                "messages": [{"role": "user", "content": content}]
+            }
+            
+            # Add thinking budget for supported models
+            if any(x in model for x in ['claude-4', 'claude-3-7', 'claude-3.7']):
+                thinking_budget = getattr(addon_prefs, 'thinking_budget', 'auto')
+                if thinking_budget != 'auto':
+                    thinking_map = {
+                        'low': 2000,
+                        'medium': 8000, 
+                        'high': 32000,
+                        'max': 64000
+                    }
+                    if thinking_budget in thinking_map:
+                        data['max_completion_tokens'] = thinking_map[thinking_budget]
+            
+            response = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=data, timeout=60)
+            response.raise_for_status()
+            
+            result = response.json()
+            
+            if 'content' in result and result['content']:
+                return result['content'][0]['text']
+            elif 'error' in result:
+                error_msg = result['error'].get('message', 'Unknown error')
+                raise AIBackendError(f"Anthropic API error: {error_msg}")
+            else:
+                raise AIBackendError("Anthropic API returned no content in response")
+                
+        except requests.exceptions.Timeout:
+            raise AIBackendError("Anthropic API request timed out. Please try again.")
+        except requests.exceptions.ConnectionError:
+            raise AIBackendError("Failed to connect to Anthropic API. Check your internet connection.")
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                raise AIBackendError("Invalid Anthropic API key. Please check your API key in preferences.")
+            elif e.response.status_code == 429:
+                raise AIBackendError("Anthropic API rate limit exceeded. Please wait and try again.")
+            elif e.response.status_code == 400:
+                raise AIBackendError("Invalid request to Anthropic API. Check your model selection and parameters.")
+            else:
+                raise AIBackendError(f"Anthropic API HTTP error {e.response.status_code}: {e.response.text}")
+        except Exception as e:
+            raise AIBackendError(f"Unexpected error calling Anthropic API: {str(e)}")
 
     def call_gemini(self, prompt, screenshot_data=None, **kwargs):
-        """Call Google Gemini API with enhanced support"""
-        api_key = self.get_api_key()
-        if not api_key:
-            raise AIBackendError("Gemini API key not set")
+        """Call Google Gemini API with enhanced multimodal support"""
+        try:
+            api_key = self.get_api_key()
+            if not api_key:
+                raise AIBackendError("Gemini API key not set in preferences")
+                
+            addon_prefs = bpy.context.preferences.addons[__package__].preferences
+            model = self.map_model_name(kwargs.get('model', addon_prefs.gemini_model), 'gemini')
             
-        addon_prefs = bpy.context.preferences.addons[__package__].preferences
-        model = self.map_model_name(kwargs.get('model', addon_prefs.gemini_model), 'gemini')
-        
-        # Build content parts
-        parts = [{"text": prompt}]
-        
-        # Add screenshot if available
-        if screenshot_data:
-            parts.append({
-                "inline_data": {
-                    "mime_type": "image/png",
-                    "data": screenshot_data
+            # Build content parts - Gemini supports multimodal input
+            parts = [{"text": prompt}]
+            
+            # Add screenshot if available - Gemini has excellent vision capabilities
+            if screenshot_data:
+                parts.append({
+                    "inline_data": {
+                        "mime_type": "image/png",
+                        "data": screenshot_data
+                    }
+                })
+                print(f"Gemini: Including viewport screenshot for enhanced context understanding")
+            
+            data = {
+                "contents": [{"parts": parts}],
+                "generationConfig": {
+                    "temperature": kwargs.get('temperature', 0.1),
+                    "maxOutputTokens": kwargs.get('max_tokens', 4000)
                 }
-            })
-        
-        data = {
-            "contents": [{"parts": parts}],
-            "generationConfig": {
-                "temperature": kwargs.get('temperature', 0.1),
-                "maxOutputTokens": kwargs.get('max_tokens', 4000)
             }
-        }
-        
-        # Add thinking configuration for supported models
-        if any(x in model for x in ['2.5', '2.0']):
-            thinking_budget = addon_prefs.thinking_budget
-            if thinking_budget != 'auto':
-                thinking_map = {
-                    'low': 2000,
-                    'medium': 8000,
-                    'high': 32000, 
-                    'max': 64000
-                }
-                if thinking_budget in thinking_map:
-                    data['generationConfig']['maxOutputTokens'] = thinking_map[thinking_budget]
-        
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
-        
-        response = requests.post(url, headers={"Content-Type": "application/json"}, json=data)
-        response.raise_for_status()
-        
-        result = response.json()
-        if 'candidates' in result and result['candidates']:
-            return result['candidates'][0]['content']['parts'][0]['text']
-        else:
-            raise AIBackendError("No response from Gemini API")
+            
+            # Add thinking configuration for supported models
+            if any(x in model for x in ['2.5', '2.0']):
+                thinking_budget = getattr(addon_prefs, 'thinking_budget', 'auto')
+                if thinking_budget != 'auto':
+                    thinking_map = {
+                        'low': 2000,
+                        'medium': 8000,
+                        'high': 32000, 
+                        'max': 64000
+                    }
+                    if thinking_budget in thinking_map:
+                        data['generationConfig']['maxOutputTokens'] = thinking_map[thinking_budget]
+            
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+            
+            response = requests.post(url, headers={"Content-Type": "application/json"}, json=data, timeout=60)
+            response.raise_for_status()
+            
+            result = response.json()
+            
+            # Enhanced error handling for Gemini responses
+            if 'candidates' in result and result['candidates']:
+                candidate = result['candidates'][0]
+                if 'content' in candidate and 'parts' in candidate['content']:
+                    return candidate['content']['parts'][0]['text']
+                else:
+                    raise AIBackendError("Gemini API returned malformed response structure")
+            elif 'error' in result:
+                error_msg = result['error'].get('message', 'Unknown error')
+                raise AIBackendError(f"Gemini API error: {error_msg}")
+            else:
+                raise AIBackendError("Gemini API returned no candidates in response")
+                
+        except requests.exceptions.Timeout:
+            raise AIBackendError("Gemini API request timed out. Please try again.")
+        except requests.exceptions.ConnectionError:
+            raise AIBackendError("Failed to connect to Gemini API. Check your internet connection.")
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                raise AIBackendError("Invalid Gemini API key. Please check your API key in preferences.")
+            elif e.response.status_code == 429:
+                raise AIBackendError("Gemini API rate limit exceeded. Please wait and try again.")
+            elif e.response.status_code == 400:
+                try:
+                    error_detail = e.response.json()
+                    if 'error' in error_detail:
+                        error_msg = error_detail['error'].get('message', 'Bad request')
+                        raise AIBackendError(f"Gemini API error: {error_msg}")
+                except:
+                    pass
+                raise AIBackendError("Invalid request to Gemini API. Check your model selection and parameters.")
+            else:
+                raise AIBackendError(f"Gemini API HTTP error {e.response.status_code}: {e.response.text}")
+        except Exception as e:
+            raise AIBackendError(f"Unexpected error calling Gemini API: {str(e)}")
 
     def call_local(self, prompt, **kwargs):
-        """Call local LLM server"""
-        addon_prefs = bpy.context.preferences.addons[__package__].preferences
-        api_url = addon_prefs.local_api_url
-        model_name = addon_prefs.local_model
-        
-        if not api_url:
-            raise AIBackendError("Local API URL not set")
-        
-        headers = {"Content-Type": "application/json"}
-        
-        data = {
-            "model": model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": kwargs.get('max_tokens', 4000),
-            "temperature": kwargs.get('temperature', 0.1)
-        }
-        
-        # Ensure URL ends with /chat/completions
-        if not api_url.endswith('/chat/completions'):
-            if api_url.endswith('/'):
-                api_url += 'chat/completions'
+        """Call local LLM server with enhanced error handling"""
+        try:
+            addon_prefs = bpy.context.preferences.addons[__package__].preferences
+            api_url = addon_prefs.local_api_url
+            model_name = getattr(addon_prefs, 'local_model', 'local-model')
+            
+            if not api_url:
+                raise AIBackendError("Local API URL not set in preferences")
+            
+            headers = {"Content-Type": "application/json"}
+            
+            data = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": kwargs.get('max_tokens', 4000),
+                "temperature": kwargs.get('temperature', 0.1)
+            }
+            
+            # Ensure URL ends with /chat/completions
+            if not api_url.endswith('/chat/completions'):
+                if api_url.endswith('/'):
+                    api_url += 'chat/completions'
+                else:
+                    api_url += '/chat/completions'
+            
+            response = requests.post(api_url, headers=headers, json=data, timeout=120)  # Longer timeout for local
+            response.raise_for_status()
+            
+            result = response.json()
+            
+            if 'choices' in result and result['choices']:
+                return result['choices'][0]['message']['content']
+            elif 'error' in result:
+                error_msg = result['error'].get('message', 'Unknown error')
+                raise AIBackendError(f"Local API error: {error_msg}")
             else:
-                api_url += '/chat/completions'
-        
-        response = requests.post(api_url, headers=headers, json=data)
-        response.raise_for_status()
-        
-        result = response.json()
-        return result['choices'][0]['message']['content']
+                raise AIBackendError("Local API returned no choices in response")
+                
+        except requests.exceptions.Timeout:
+            raise AIBackendError("Local API request timed out. Check if your local server is running and responsive.")
+        except requests.exceptions.ConnectionError:
+            raise AIBackendError(f"Failed to connect to local API at {api_url}. Check if your local server is running.")
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                raise AIBackendError("Local API endpoint not found. Check your API URL configuration.")
+            elif e.response.status_code == 500:
+                raise AIBackendError("Local API server error. Check your local server logs.")
+            else:
+                raise AIBackendError(f"Local API HTTP error {e.response.status_code}: {e.response.text}")
+        except Exception as e:
+            raise AIBackendError(f"Unexpected error calling local API: {str(e)}")
 
     def generate_code(self, user_request, backend=None, **kwargs):
         """Enhanced code generation with comprehensive context and visual input"""
-        backend = backend or self.backend
+        # Ensure backend consistency
+        if backend:
+            self.backend = backend
+        else:
+            self.sync_backend_with_prefs()
+            backend = self.backend
         
         # Store current state for diff
         self.store_scene_state()
@@ -546,7 +712,7 @@ class AIClient:
         prompt, screenshot_data = self.build_prompt(user_request)
         
         try:
-            # Call appropriate backend
+            # Call appropriate backend with enhanced error handling
             if backend == 'openai':
                 response = self.call_openai(prompt, screenshot_data, **kwargs)
             elif backend == 'anthropic':
@@ -556,7 +722,7 @@ class AIClient:
             elif backend == 'local':
                 response = self.call_local(prompt, **kwargs)
             else:
-                raise AIBackendError(f"Unknown backend: {backend}")
+                raise AIBackendError(f"Unsupported backend '{backend}'. Available backends: openai, anthropic, gemini, local")
             
             # Log the interaction
             self.response_log.append({
@@ -564,13 +730,22 @@ class AIClient:
                 'backend': backend,
                 'user_request': user_request,
                 'response': response,
-                'has_screenshot': screenshot_data is not None
+                'has_screenshot': screenshot_data is not None,
+                'prompt_tokens': self.estimate_token_count(prompt),
+                'response_tokens': self.estimate_token_count(response)
             })
             
             return response
             
+        except AIBackendError:
+            # Re-raise AIBackendError as-is for proper UI display
+            raise
+        except requests.exceptions.RequestException as e:
+            # Network-related errors
+            raise AIBackendError(f"Network error with {backend}: {str(e)}")
         except Exception as e:
-            raise AIBackendError(f"Failed to generate code with {backend}: {str(e)}")
+            # Catch-all for unexpected errors
+            raise AIBackendError(f"Unexpected error with {backend}: {str(e)}")
 
     def get_conversation_history(self, limit=5):
         """Get recent conversation history"""
