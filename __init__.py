@@ -6,8 +6,8 @@ bl_info = {
     "location": "View3D > Sidebar > BlendAI",
     "description": "AI-powered 3D content generation using OpenAI GPT, Anthropic Claude, Google Gemini, and Local LLMs",
     "category": "Development",
-    "doc_url": "https://github.com/your-repo/blendai",
-    "tracker_url": "https://github.com/your-repo/blendai/issues",
+    "doc_url": "https://github.com/Whoisraeen/BlendAI",
+    "tracker_url": "https://github.com/Whoisraeen/BlendAI/issues",
 }
 
 import bpy
