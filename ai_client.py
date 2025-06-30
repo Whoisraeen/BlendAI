@@ -170,8 +170,9 @@ class AIClient:
     
     def get_detailed_scene_context(self, trim_for_backend=None):
         """Get comprehensive scene context including all objects, materials, etc."""
+        scene = bpy.context.scene
         context = {
-            'scene_name': bpy.context.scene.name,
+            'scene_name': scene.name if scene else None,
             'selected_objects': [],
             'active_object': None,
             'all_objects': [],
@@ -182,9 +183,9 @@ class AIClient:
             'collections': [],
             'mode': bpy.context.mode,
             'blender_version': f"{bpy.app.version[0]}.{bpy.app.version[1]}.{bpy.app.version[2]}",
-            'render_engine': bpy.context.scene.render.engine,
-            'frame_current': bpy.context.scene.frame_current,
-            'frame_range': f"{bpy.context.scene.frame_start}-{bpy.context.scene.frame_end}"
+            'render_engine': scene.render.engine if scene else None,
+            'frame_current': scene.frame_current if scene else None,
+            'frame_range': f"{scene.frame_start}-{scene.frame_end}" if scene else None
         }
         
         # Selected objects with detailed info
